@@ -1,11 +1,19 @@
-anthropic>=0.40.0
-python-dotenv>=1.0.0
-rich>=13.0.0
-pytest>=8.0.0
-psutil>=5.9.0
-requests>=2.31.0
+# ── Core (required) ──────────────────────────────────────────────
+anthropic>=0.40.0        # Claude API client (streaming)
+python-dotenv>=1.0.0     # Loads .env into the environment
+rich>=13.0.0             # Terminal formatting for the CLI
+requests>=2.31.0         # HTTP client for the Ollama fallback
+psutil>=5.9.0            # System metrics for the system_pulse skill
+
+# ── Optional: chat adapters ──────────────────────────────────────
+# Only needed if you run the Telegram or Discord bot.
 python-telegram-bot>=21.0
 discord.py>=2.3.0
-# Optional — needed for file_writer skill
-python-docx>=1.1.0
-fpdf2>=2.7.0
+
+# ── Optional: file_writer skill output formats ───────────────────
+# Only needed to write Word / PDF documents.
+python-docx>=1.1.0       # .docx output
+fpdf2>=2.7.0             # .pdf output
+
+# ── Dev / testing ────────────────────────────────────────────────
+pytest>=8.0.0

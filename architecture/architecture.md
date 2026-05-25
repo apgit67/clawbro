@@ -1,8 +1,18 @@
 # ClawBro Architecture
 **Version:** 1.0.0
-**Date:** 2026-04-07
+**Date:** 2026-04-07 (reconciled with the implementation 2026-05-25)
 **Author:** Architect Agent (Claude claude-sonnet-4-6)
-**Status:** Final — Ready for Implementation
+**Status:** Implemented — this document has been updated to match the code in `src/`.
+
+> **Reconciliation note (2026-05-25):** the original spec was written before
+> implementation. It has since been edited to reflect what was actually built —
+> notably: env-var configuration (no TOML/`tomllib`); `requests` for the Ollama
+> fallback (not `httpx`); skills calling `complete()` with the system prompt as a
+> leading user message; the adapter (not the skill) handling memory writes; the
+> `--adapter {cli,telegram,discord}` entry-point flag; the `file_writer` skill;
+> and the actual SQLite schema (`long_term_memory`, `timestamp` column). Where a
+> detail might still drift (e.g. per-skill `trigger_patterns`), the source under
+> `src/` is authoritative.
 
 ---
 
@@ -115,10 +125,10 @@ ClawBro is designed to run comfortably on:
 ║  │ sandbox_guard         │    ║   ║  │  + SQLite flush       │   ║
 ║  │ system_pulse          │    ║   ║  └──────────────────────┘   ║
 ║  │ research_summarizer   │    ║   ║                              ║
-║  │ (FallbackSkill)       │    ║   ║  ┌──────────────────────┐   ║
-║  └───────────────────────┘    ║   ║  │  memory/long_term.py │   ║
-║                               ║   ║  │  (LongTermMemory)    │   ║
-║  Each skill may call:         ║   ║  │  SQLite FTS5 search  │   ║
+║  │ file_writer           │    ║   ║  ┌──────────────────────┐   ║
+║  │ (FallbackSkill)       │    ║   ║  │  memory/long_term.py │   ║
+║  └───────────────────────┘    ║   ║  │  (LongTermMemory)    │   ║
+║                               ║   ║  │  SQLite FTS5 search  │   ║
 ║  - ClaudeClient (streaming)   ║   ║  │  + structured facts  │   ║
 ║  - MemoryStore (read/write)   ║   ║  └──────────────────────┘   ║
 ╚═══════════════════════════════╝   ╚══════════════════════════════╝
@@ -295,8 +305,10 @@ class SkillBase(ABC):
         matches the given raw message text.
 
         The router calls score() on every registered skill and picks the highest.
-        The default implementation in SkillBase counts trigger_patterns matches —
-        subclasses may override for more sophisticated scoring.
+        The default implementation in SkillBase counts how many trigger_patterns
+        match, then divides by a fixed denominator of 3 (capped at 1.0) — so two
+        pattern hits clear the 0.4 threshold and three saturate to 1.0. Subclasses
+        may override for more sophisticated scoring.
 
         Args:
             message: The raw user message text (lowercased before scoring).
@@ -354,8 +366,9 @@ class SkillRouter:
 
     def register(self, skill: SkillBase) -> None:
         """
-        Register a skill at runtime. Called during app startup for each skill.
-        Raises ValueError if a skill with the same name is already registered.
+        Register a skill. Called during app startup for each skill.
+        Raises TypeError if the argument is not a SkillBase instance.
+        (Duplicate names are not rejected — registration is append-only.)
 
         Args:
             skill: An instantiated SkillBase subclass.
@@ -366,11 +379,10 @@ class SkillRouter:
         Score all registered skills and return the best match.
 
         Algorithm:
-        1. Lowercase message.
-        2. Call skill.score(message) for every registered skill.
-        3. Sort by score descending.
-        4. If top score >= CONFIDENCE_THRESHOLD, return (top_skill, top_score).
-        5. Else return (self.fallback, 0.0).
+        1. Call skill.score(message) for every registered skill, tracking the
+           highest score seen (a skill raising in score() is treated as 0.0).
+        2. If the best score >= CONFIDENCE_THRESHOLD, return (best_skill, best_score).
+        3. Else return (self.fallback, 0.0).
 
         Args:
             message: Raw user message text.
@@ -402,11 +414,13 @@ class MemoryStore:
     Injected into ConversationContext at session start.
     """
 
-    def __init__(self, session_id: str, db_path: str) -> None:
+    def __init__(self, session_id: str, db_path: str | None = None) -> None:
         """
         Args:
             session_id: UUID string for the current conversation session.
-            db_path: Absolute path to the SQLite database file.
+            db_path: Path to the SQLite database file. If None, defaults to
+                     ~/.clawbro/memory.db. The connection is opened with
+                     check_same_thread=False, WAL mode, and foreign keys on.
         """
 
     # --- Short-term (session-scoped) ---
@@ -443,8 +457,16 @@ class MemoryStore:
 
     def clear_session(self) -> None:
         """
-        Clear the in-memory ring buffer for this session.
-        SQLite rows are retained (for audit/recall purposes).
+        Clear this session's conversation history — both the in-memory ring
+        buffer and the SQLite rows for this session_id.
+        """
+
+    def learn(self, text: str) -> str:
+        """
+        Convenience helper: parse a natural-language statement into a
+        (key, value) pair using simple heuristics (strips preambles like
+        "remember that", splits on ':', ' is ', ' = ', etc.) and saves it to
+        long-term memory. Returns a confirmation string. No Claude call.
         """
 
     # --- Long-term (persistent, cross-session) ---
@@ -516,39 +538,53 @@ class ClaudeClient:
     MAX_TOKENS: int = 8096
     HISTORY_TOKEN_BUDGET: int = 8000   # Passed to MemoryStore.get_history()
 
-    def __init__(self, api_key: str, model: str = DEFAULT_MODEL) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = DEFAULT_MODEL,
+        use_ollama: bool = False,
+        ollama_model: str = "llama3",
+        ollama_host: str = "http://localhost:11434",
+        ollama_api_key: str = "",
+    ) -> None:
         """
         Args:
             api_key: Anthropic API key. Sourced from ANTHROPIC_API_KEY env var.
             model: Claude model ID. Can be overridden per-call.
+            use_ollama: Route calls to Ollama instead of the Claude API.
+            ollama_model / ollama_host / ollama_api_key: Ollama configuration.
+                When an API key is present, calls hit ollama.com directly; with
+                no key, calls hit the local host. On a 401/403 the client falls
+                back transparently to the Claude API.
         """
 
     def stream(
         self,
-        system_prompt: str,
-        history: list[dict],
-        user_message: str,
+        messages: list[dict],
+        system: str = "",
+        max_tokens: int = 2048,
         tools: list[dict] | None = None,
         model: str | None = None,
     ) -> Iterator[TurnEvent]:
         """
-        Stream a Claude API call, yielding TurnEvent objects.
+        Stream a Claude (or Ollama) call, yielding TurnEvent objects.
 
         Behavior:
         - Opens a streaming message with the Anthropic SDK.
         - Yields ChunkEvent for each text delta.
-        - Yields ThinkingEvent for thinking block deltas (if model supports it).
+        - Yields ThinkingEvent for thinking block deltas (if the model emits them).
         - Yields ToolCallEvent when the model requests a tool.
-        - Yields ToolResultEvent after the caller handles the tool and feeds back.
-        - Yields DoneEvent with full assembled text and token counts when done.
-        - If the model returns stop_reason="tool_use", the generator pauses at
-          ToolCallEvent and waits for the caller to send tool results before continuing.
-          (Implemented via a two-phase generator or callback pattern.)
+        - Yields DoneEvent with the full assembled text and token counts at the end.
+        - If use_ollama is set, streams from Ollama instead; an Ollama 401/403
+          falls back to the Claude API mid-stream.
+
+        Note: the full message list (history + current user turn) is passed in as
+        `messages` by the caller; the system prompt is a separate `system` arg.
 
         Args:
-            system_prompt: The system prompt string for this turn.
-            history: List of message dicts (already token-trimmed by MemoryStore).
-            user_message: The current user turn text.
+            messages: Conversation history including the current user message.
+            system: System prompt string (default "").
+            max_tokens: Max tokens to generate (default 2048).
             tools: Optional list of Anthropic tool spec dicts.
             model: Override model for this call only.
 
@@ -558,9 +594,9 @@ class ClaudeClient:
 
     def complete(
         self,
-        system_prompt: str,
-        history: list[dict],
-        user_message: str,
+        messages: list[dict],
+        system: str = "",
+        max_tokens: int = 2048,
         tools: list[dict] | None = None,
         model: str | None = None,
     ) -> str:
@@ -672,54 +708,33 @@ class LongTermMemory:
 
 ## 4. Tech Stack
 
+This table reflects the libraries actually used in the current build.
+
 | Layer | Library | Version | Rationale |
 |-------|---------|---------|-----------|
-| **Language** | Python | 3.11+ | Dataclasses, `match` statements, `tomllib` stdlib, speed improvements |
-| **Claude API** | `anthropic` | ^0.50.0 | Official Anthropic SDK, streaming support, tool use |
-| **CLI formatting** | `rich` | ^13.0 | Pretty tables, syntax highlighting, streaming output panels |
-| **Env config** | `python-dotenv` | ^1.0 | Load `.env` file into `os.environ` on startup |
+| **Language** | Python | 3.11+ | Dataclasses, union types, speed improvements |
+| **Claude API** | `anthropic` | >=0.40.0 | Official Anthropic SDK, streaming support |
+| **CLI formatting** | `rich` | >=13.0 | Pretty tables, live streaming output panels |
+| **Env config** | `python-dotenv` | >=1.0 | Load `.env` file into `os.environ` on startup |
 | **Memory** | `sqlite3` | stdlib | No extra dependency. WAL mode, FTS5 extension |
-| **Telegram adapter** | `python-telegram-bot` | ^21.0 | Optional. Async-first, well-maintained |
-| **Discord adapter** | `discord.py` | ^2.3 | Optional. Async-first, slash commands support |
-| **Local LLM fallback** | `ollama` (HTTP) | n/a | Optional. Call via `httpx` to `localhost:11434` — no SDK needed |
-| **Testing** | `pytest` | ^8.0 | Standard. `pytest-asyncio` for async adapter tests |
-| **HTTP client** | `httpx` | ^0.27 | Used only for Ollama fallback. `anthropic` SDK handles its own HTTP |
-| **Config file** | `tomllib` | stdlib (3.11+) | Parse `~/.clawbro/config.toml`. No extra dependency |
-| **Type checking** | `mypy` | ^1.10 | Strict mode on `core/` and `memory/`. Skills are checked but may use `# type: ignore` sparingly |
-| **Linting** | `ruff` | ^0.5 | Fast, single tool replaces flake8 + isort + pyupgrade |
+| **System metrics** | `psutil` | >=5.9 | Core dep — powers the `system_pulse` skill |
+| **HTTP client** | `requests` | >=2.31 | Used for the Ollama fallback (local + cloud) |
+| **Telegram adapter** | `python-telegram-bot` | >=21.0 | Optional. Async-first |
+| **Discord adapter** | `discord.py` | >=2.3 | Optional. Async-first |
+| **File output** | `python-docx`, `fpdf2` | >=1.1 / >=2.7 | Optional — `.docx` / `.pdf` output for `file_writer` |
+| **Testing** | `pytest` | >=8.0 | Test suite |
 
-### Configuration File (TOML)
+> **Deviations from the original v1.0 plan:** the Ollama fallback uses
+> `requests` (not `httpx`); `mypy`/`ruff`/`pytest-asyncio` are not pinned
+> dependencies; and there is no TOML config file (see below).
 
-ClawBro reads `~/.clawbro/config.toml` on startup. If not found, uses defaults.
+### Configuration
 
-```toml
-# ~/.clawbro/config.toml
-
-[claude]
-model = "claude-sonnet-4-6"
-max_tokens = 8096
-history_token_budget = 8000
-
-[memory]
-db_path = "~/.clawbro/memory.db"
-short_term_max_turns = 50
-
-[router]
-confidence_threshold = 0.4
-
-[adapters.telegram]
-enabled = false
-# token = set via TELEGRAM_BOT_TOKEN env var
-
-[adapters.discord]
-enabled = false
-# token = set via DISCORD_BOT_TOKEN env var
-
-[ollama]
-enabled = false
-base_url = "http://localhost:11434"
-model = "llama3.2"
-```
+ClawBro is configured entirely through **environment variables** loaded from a
+`.env` file via `python-dotenv` — there is no `config.toml` and no `tomllib`
+usage in the current build. CLI flags (`--model`, `--ollama`, `--adapter`,
+`--db`, `--no-health-check`) override the corresponding env vars at launch. See
+[Appendix B](#appendix-b-environment-variables) for the full variable list.
 
 ---
 
@@ -735,15 +750,15 @@ The router is a simple, deterministic confidence scorer. It does NOT call the LL
 CONFIDENCE_THRESHOLD = 0.4
 
 def route(message: str) -> tuple[SkillBase, float]:
-    lowered = message.lower().strip()
-    scores = [(skill, skill.score(lowered)) for skill in registered_skills]
-    scores.sort(key=lambda x: x[1], reverse=True)
+    best_skill, best_score = fallback_skill, 0.0
+    for skill in registered_skills:
+        score = skill.score(message)   # exceptions treated as 0.0
+        if score > best_score:
+            best_skill, best_score = skill, score
 
-    best_skill, best_score = scores[0]
     if best_score >= CONFIDENCE_THRESHOLD:
         return (best_skill, best_score)
-    else:
-        return (fallback_skill, 0.0)
+    return (fallback_skill, 0.0)
 ```
 
 ### Default `SkillBase.score()` Implementation
@@ -753,95 +768,115 @@ The base class provides a default implementation that skills can use or override
 ```python
 def score(self, message: str) -> float:
     """
-    Default implementation: keyword/regex match counter.
+    Default implementation: regex match counter with a fixed denominator.
 
     Algorithm:
-    1. For each pattern in self.trigger_patterns:
-       - If pattern is a plain string: check if it's a substring of message.
-       - If pattern starts with '^' or contains regex metacharacters: compile and search.
-    2. Count matches.
-    3. Normalize: score = min(1.0, matches / len(trigger_patterns))
-       (at least one match needed for non-zero score)
-    4. Boost: if any single pattern matches AND the match is at the start of the
-       message, add 0.1 to the score (capped at 1.0).
+    1. If the skill has no trigger_patterns, return 0.0.
+    2. Lowercase the message.
+    3. For each pattern in self.trigger_patterns, use re.search (patterns are
+       regexes; plain strings work as literal regexes).
+    4. Count matches and normalise: score = min(matches / 3.0, 1.0).
+       So 2 hits → 0.67 (clears the 0.4 threshold), 3+ hits → 1.0.
+
+    There is no start-of-message boost in the current implementation.
     """
 ```
 
 ### Skill Registration (at startup in main.py)
 
-```python
-router = SkillRouter(skills=[], fallback=FallbackSkill())
+In the current build, `main.py` calls `get_all_skills()` (from `skills/__init__.py`)
+and passes the list to the router constructor, which registers each in turn:
 
-router.register(SystemArchitectSkill())
-router.register(KnowledgeSynthesizerSkill())
-router.register(TechnicalProposalGeneratorSkill())
-router.register(DataRepurposerSkill())
-router.register(SandboxGuardSkill())
-router.register(SystemPulseSkill())
-router.register(ResearchSummarizerSkill())
+```python
+from skills import get_all_skills
+from skills.base import FallbackSkill
+
+router = SkillRouter(skills=get_all_skills(), fallback=FallbackSkill())
+
+# get_all_skills() returns one instance of each:
+#   SystemArchitectSkill, KnowledgeSynthesizerSkill,
+#   TechnicalProposalGeneratorSkill, DataRepurposerSkill,
+#   SandboxGuardSkill, SystemPulseSkill, ResearchSummarizerSkill,
+#   FileWriterSkill
+# FallbackSkill is passed separately and is never scored.
 ```
 
 ### Trigger Pattern Examples per Skill
 
+> These are *illustrative*. The authoritative `trigger_patterns` live as a
+> class attribute on each skill in `src/skills/*.py` and have drifted from the
+> original list below (e.g. `SystemArchitectSkill` now also matches
+> `"infrastructure"`, `"python script"`, `"hardware"`, etc.). Treat the source
+> as the source of truth.
+
 | Skill | trigger_patterns |
 |-------|-----------------|
-| `SystemArchitectSkill` | `["architect", "design system", "draw diagram", "component diagram", "system design", "architecture"]` |
+| `SystemArchitectSkill` | `["architect", "design system", "draw.*diagram", "system design", "infrastructure", "component diagram", "create.*script", "python script", "executable", "hardware", "utility script"]` |
 | `KnowledgeSynthesizerSkill` | `["synthesize", "combine", "knowledge", "connect.*ideas", "link.*concepts"]` |
 | `TechnicalProposalGeneratorSkill` | `["proposal", "technical spec", "write.*spec", "rfc", "technical document"]` |
 | `DataRepurposerSkill` | `["repurpose", "reformat", "convert.*data", "transform.*data", "restructure"]` |
 | `SandboxGuardSkill` | `["sandbox", "safe.*run", "isolate", "execute.*safely", "check.*security"]` |
 | `SystemPulseSkill` | `["system.*status", "pulse", "health.*check", "disk.*usage", "cpu.*usage", "memory.*usage"]` |
 | `ResearchSummarizerSkill` | `["summarize", "summary", "tldr", "research", "paper", "article.*summary"]` |
+| `FileWriterSkill` | `["write.*file", "create.*file", "save.*(as\|to a file)", "export.*(as\|to)", "generate.*(file\|document)", "word doc", "docx", ".pdf", ".txt", ".md", ".csv", ".json", ".html", ...]` |
 | `FallbackSkill` | `[]` — never scores; only used when all others score below threshold |
 
 ### Fallback Behavior
 
-`FallbackSkill` wraps a plain Claude API call with no special system prompt additions. It is the general-purpose assistant. When it handles a turn, `SkillResult.skill_name = "fallback"` and `SkillResult.metadata = {"confidence": 0.0}`.
+`FallbackSkill` wraps a plain Claude API call with no special system prompt additions. It is the general-purpose assistant. When it handles a turn it returns `SkillResult(text=response, skill_name="fallback", success=True)` — note it does not set a `confidence` metadata field; the router tracks confidence separately on the `ConversationContext`.
 
 ---
 
 ## 6. File Structure
 
 ```
-claudeclaw/
-├── outputs/
-│   └── src/                              # ClawBro source root
-│       ├── main.py                       # Entry point: parse args, init all components, run adapter
-│       │
-│       ├── core/
-│       │   ├── __init__.py               # Re-exports: SkillRouter, ConversationContext, ClaudeClient
-│       │   ├── router.py                 # SkillRouter class — dispatch logic, confidence scoring
-│       │   ├── context.py                # InputMessage, ConversationContext, TurnEvent dataclasses
-│       │   └── claude_client.py          # ClaudeClient — streaming wrapper, tool loop, truncation
-│       │
-│       ├── skills/
-│       │   ├── __init__.py               # Re-exports all skill classes + SkillBase
-│       │   ├── base.py                   # SkillBase ABC + SkillResult dataclass
-│       │   ├── system_architect.py       # Skill: system design diagrams and architecture docs
-│       │   ├── knowledge_synthesizer.py  # Skill: cross-domain knowledge linking and synthesis
-│       │   ├── technical_proposal_generator.py  # Skill: RFC / technical spec writing
-│       │   ├── data_repurposer.py        # Skill: data format conversion and restructuring
-│       │   ├── sandbox_guard.py          # Skill: safe code execution analysis and sandboxing advice
-│       │   ├── system_pulse.py           # Skill: system health metrics (disk, CPU, RAM via psutil)
-│       │   └── research_summarizer.py    # Skill: article/paper summarization and extraction
-│       │
-│       ├── memory/
-│       │   ├── __init__.py               # Re-exports: MemoryStore
-│       │   ├── short_term.py             # ShortTermMemory — ring buffer + SQLite flush
-│       │   ├── long_term.py              # LongTermMemory — FTS5 key-value store
-│       │   └── store.py                  # MemoryStore facade — unified API for skills
-│       │
-│       └── adapters/
-│           ├── __init__.py               # Re-exports adapter classes
-│           ├── cli.py                    # CLIAdapter — rich prompt, streaming output renderer
-│           ├── telegram_adapter.py       # TelegramAdapter — python-telegram-bot integration
-│           └── discord_adapter.py        # DiscordAdapter — discord.py integration
+claudeclaw v2/
+├── src/                                  # ClawBro source root
+│   ├── main.py                           # Entry point: parse args, init components, select adapter
+│   │
+│   ├── core/
+│   │   ├── __init__.py                   # Re-exports core classes
+│   │   ├── router.py                     # SkillRouter — dispatch logic, confidence scoring
+│   │   ├── context.py                    # InputMessage, ConversationContext, TurnEvent dataclasses
+│   │   └── claude_client.py              # ClaudeClient — streaming wrapper + Ollama fallback
+│   │
+│   ├── skills/
+│   │   ├── __init__.py                   # Re-exports skills + get_all_skills()
+│   │   ├── base.py                       # SkillBase ABC + FallbackSkill
+│   │   ├── system_architect.py           # Skill: system design diagrams and architecture docs
+│   │   ├── knowledge_synthesizer.py      # Skill: cross-domain knowledge linking and synthesis
+│   │   ├── technical_proposal_generator.py  # Skill: RFC / technical spec writing
+│   │   ├── data_repurposer.py            # Skill: data format conversion and restructuring
+│   │   ├── sandbox_guard.py              # Skill: safe code execution analysis and sandboxing advice
+│   │   ├── system_pulse.py               # Skill: system health metrics (disk, CPU, RAM via psutil)
+│   │   ├── research_summarizer.py        # Skill: article/paper summarization and extraction
+│   │   ├── file_writer.py                # Skill: generate content and write to .txt/.md/.csv/.json/.html/.docx/.pdf
+│   │   └── fallback.py                   # Re-exports FallbackSkill from base.py (convenience import)
+│   │
+│   ├── memory/
+│   │   ├── __init__.py                   # Re-exports MemoryStore + init_db
+│   │   ├── init_db.py                    # Schema creation / migration
+│   │   ├── short_term.py                 # ShortTermMemory — ring buffer + SQLite flush
+│   │   ├── long_term.py                  # LongTermMemory — FTS5 key-value store
+│   │   └── store.py                      # MemoryStore facade — unified API for skills
+│   │
+│   └── adapters/
+│       ├── __init__.py                   # Re-exports adapter classes
+│       ├── cli.py                        # CLIAdapter — rich prompt, streaming output renderer
+│       ├── telegram_adapter.py           # TelegramAdapter — python-telegram-bot integration
+│       └── discord_adapter.py            # DiscordAdapter — discord.py integration
 │
-├── setup.sh                              # Bootstrap: venv create, pip install, .env copy
-├── .env.example                          # Template: ANTHROPIC_API_KEY=, TELEGRAM_BOT_TOKEN=, etc.
-├── requirements.txt                      # Pinned deps for core + optional adapters
-└── README.md                             # User-facing: quickstart, config, skill list
+├── tests/                                # pytest suite
+├── architecture/architecture.md          # This document
+├── .env.example                          # Config template
+├── .gitignore
+├── requirements.txt                      # Core + optional dependencies
+├── README.md                             # User-facing overview
+└── SETUP.md                              # Install & run guide
 ```
+
+> **Note:** the canonical `FallbackSkill` is defined in `skills/base.py`. The
+> `score()` default also lives in `SkillBase` (base.py), not a separate module.
 
 ### File Responsibilities (one line each)
 
@@ -887,7 +922,7 @@ claudeclaw/
 | Multi-backend memory abstraction | ZeroClaw `Memory` trait | **Skip** | One backend (SQLite) until a real need arises |
 | Personality system (SOUL.md, IDENTITY.md) | ZeroClaw `personality.rs` | **Simplify** | Single system prompt in `claude_client.py`; user can edit it |
 | Thinking level control | ZeroClaw `thinking.rs` | **Simplify** | Expose `--thinking` CLI flag mapped to `budget_tokens` in the API call |
-| Pairing guard / access control | ZeroClaw `security/` | **Simplify** | CLI is local-only. Telegram/Discord adapters use bot token auth only |
+| Pairing guard / access control | ZeroClaw `security/` | **Simplify** | CLI is local-only. The Telegram adapter additionally enforces a fail-closed `TELEGRAM_ALLOWED_USER_IDS` allowlist (rejects all if unset); Discord relies on bot-token auth |
 | Plugin / npm extension system | OpenClaw | **Skip** | Python package imports are sufficient; no runtime plugin loading |
 | Ollama fallback | Neither (custom) | **Build** | Simple `httpx` POST to `localhost:11434/api/chat`; same `ClaudeClient` interface |
 
@@ -970,18 +1005,18 @@ Each module has a strict owns/does-not-own table. Coupling violations must be ca
 
 ## 9. Data Flow Walkthrough
 
-**Scenario:** User types `"Design me a system architecture for a URL shortener"` at the CLI prompt.
+**Scenario:** User types `"Give me a system design with a component diagram for a URL shortener"` at the CLI prompt.
 
 ---
 
 **Step 1 — Adapter receives input**
 
-`adapters/cli.py` reads the input string from the terminal via `rich`'s `Prompt.ask()`.
+`adapters/cli.py` reads the input string from the terminal via `rich`'s `console.input()`.
 
 It constructs:
 ```python
 InputMessage(
-    text="Design me a system architecture for a URL shortener",
+    text="Give me a system design with a component diagram for a URL shortener",
     source="cli",
     user_id="local",
     session_id="a1b2c3d4-...",   # UUID generated at session start
@@ -994,43 +1029,46 @@ InputMessage(
 
 **Step 2 — Router scores all skills**
 
-`core/router.py` receives the `InputMessage`. It lowercases the text:
-`"design me a system architecture for a url shortener"`
+`core/router.py` receives the `InputMessage`. The default `score()` lowercases
+the text internally and runs `re.search` for each trigger pattern, dividing hits
+by 3 (capped at 1.0):
 
-It calls `skill.score(lowered)` for every registered skill:
-
-| Skill | Pattern Hit | Score |
+| Skill | Pattern Hits | Score |
 |-------|------------|-------|
-| `SystemArchitectSkill` | "architecture", "system" → 2/6 + start boost = **0.43** | 0.43 |
+| `SystemArchitectSkill` | `"system design"` + `"component diagram"` → 2/3 = **0.67** | 0.67 |
 | `KnowledgeSynthesizerSkill` | no hit | 0.0 |
 | `TechnicalProposalGeneratorSkill` | no hit | 0.0 |
 | `DataRepurposerSkill` | no hit | 0.0 |
 | `SandboxGuardSkill` | no hit | 0.0 |
-| `SystemPulseSkill` | "system" alone → 1/6 = **0.16** | 0.16 |
+| `SystemPulseSkill` | no hit | 0.0 |
 | `ResearchSummarizerSkill` | no hit | 0.0 |
 
-`SystemArchitectSkill` wins with 0.43 ≥ threshold 0.4.
+`SystemArchitectSkill` wins with 0.67 ≥ threshold 0.4.
 
-Router returns `(SystemArchitectSkill, 0.43)`.
+Router returns `(SystemArchitectSkill, 0.67)`. (Note: a vaguer prompt like
+"design me a system architecture" hits only one pattern → 0.33, below threshold,
+and would route to the fallback assistant instead.)
 
 ---
 
 **Step 3 — Context is prepared**
 
-The adapter (or `main.py` session layer) constructs a `ConversationContext`:
+The adapter retrieves trimmed history, **writes the user turn to memory**, and
+constructs a `ConversationContext`. (In the CLI adapter the user turn is recorded
+*before* dispatch — see `_handle_message`.)
 
 ```python
-# Retrieve trimmed history from MemoryStore
-history = memory_store.get_history(max_tokens=8000)
-# Returns e.g. last 3 turns from earlier in the session
+# Retrieve trimmed history from MemoryStore, then record this user turn
+history = memory_store.get_history()        # default budget 8000 tokens
+memory_store.add_turn("user", input_message.text)
 
 context = ConversationContext(
     message=input_message,
     history=history,
     memory=memory_store,
     claude=claude_client,
-    skill_name="system_architect",
-    confidence=0.43,
+    skill_name="system_architect",   # set by router during dispatch()
+    confidence=0.67,
     session_id="a1b2c3d4-..."
 )
 ```
@@ -1039,80 +1077,87 @@ context = ConversationContext(
 
 **Step 4 — Skill handles the request**
 
-`SystemArchitectSkill.handle(context)` is called. Inside:
+`router.dispatch()` calls `SystemArchitectSkill.handle(context)`. Inside (see
+`skills/system_architect.py` for the real implementation):
 
-1. Builds a skill-specific system prompt:
+1. Assembles the message list, prepending its skill-specific instructions as a
+   leading user message rather than a separate `system=` argument:
+   ```python
+   messages = [
+       {"role": "user", "content": _SYSTEM_PROMPT},   # "You are an expert systems architect..."
+       *context.history,
+       {"role": "user", "content": context.message.text},
+   ]
    ```
-   "You are an expert software architect. When asked to design a system,
-    produce an ASCII component diagram followed by a description of each component..."
-   ```
 
-2. Calls `context.claude.stream(system_prompt, history, context.message.text)`.
+2. Calls `context.claude.complete(messages)` — the non-streaming convenience
+   wrapper that drains `stream()` and returns the full assembled text. (Skills in
+   this build use `complete()`; token-by-token streaming via `stream()` is
+   available but not currently used by the bundled skills.)
 
-3. Iterates over the returned `TurnEvent` generator:
-   - For each `ChunkEvent`: appends token to a `response_buffer` string AND yields the chunk upstream to the adapter for live rendering.
-   - For each `ToolCallEvent`: executes the tool (e.g., `memory_recall`), feeds `ToolResultEvent` back.
-   - For `DoneEvent`: breaks the loop.
-
-4. Calls `context.memory.add_turn("user", context.message.text)`.
-5. Calls `context.memory.add_turn("assistant", response_buffer)`.
-6. Optionally calls `context.memory.save("last_architecture_request", context.message.text)` for long-term recall.
-
-7. Returns:
+3. Returns:
    ```python
    SkillResult(
-       text=response_buffer,
+       text=artifact,
        skill_name="system_architect",
        success=True,
-       metadata={"confidence": 0.43}
+       metadata={"artifact_type": "script_or_diagram"},
    )
    ```
 
+Note: skills do **not** write to memory themselves — the adapter records both the
+user and assistant turns (see Steps 3 and 7). The router sets `skill_name` and
+`confidence` on the context during `dispatch()`.
+
 ---
 
-**Step 5 — Claude API streaming**
+**Step 5 — Claude API call**
 
-Inside `ClaudeClient.stream()`:
+Inside `ClaudeClient.complete()` → `stream()` → `_stream_claude()`:
 
-1. Calls `anthropic.Anthropic().messages.stream(...)` with:
-   - `model="claude-sonnet-4-6"`
-   - `system=system_prompt`
-   - `messages=[...history..., {"role": "user", "content": "Design me..."}]`
-   - `max_tokens=8096`
+1. Calls `self._client.messages.stream(...)` with:
+   - `model="claude-sonnet-4-6"` (or the per-call / env override)
+   - `messages=[{"role": "user", "content": _SYSTEM_PROMPT}, ...history..., {user turn}]`
+   - `max_tokens=2048` (the default for `complete()`)
+   - `system=...` only if a non-empty system string was passed (skills here pass none)
 
 2. For each event from the SDK stream:
-   - `text_delta` → `yield ChunkEvent(text=delta.text)`
-   - `content_block_stop` with thinking → `yield ThinkingEvent(text=block.thinking)`
-   - `tool_use` block → `yield ToolCallEvent(tool_name=..., tool_input=..., tool_use_id=...)`
-   - Stream end → `yield DoneEvent(full_text=assembled, input_tokens=..., output_tokens=...)`
+   - text delta → `yield ChunkEvent(text=delta.text)`
+   - thinking delta → `yield ThinkingEvent(text=delta.thinking)`
+   - tool-use block start → `yield ToolCallEvent(tool_name=..., tool_use_id=...)`
+   - stream end → `yield DoneEvent(full_text=assembled, input_tokens=..., output_tokens=...)`
+
+   `complete()` collects the `ChunkEvent`/`DoneEvent` text and returns the final string.
+   If `use_ollama` is set, the call is served from Ollama instead, falling back to
+   Claude on a 401/403.
 
 ---
 
-**Step 6 — Adapter renders streaming output**
+**Step 6 — Adapter renders output**
 
-`adapters/cli.py` maintains a `rich.Live` panel. As `ChunkEvent` objects arrive (forwarded by the skill), it appends each token to the panel's markdown content and refreshes the display — giving the user a live token-by-token output experience.
-
-When `SkillResult` is returned, the adapter prints a dim status line:
-```
-[system_architect | confidence: 0.43 | 512 tokens]
-```
+The CLI adapter prints a dim `(using: system_architect)` line before dispatch,
+then renders the returned `SkillResult.text` (the `rich.Live` panel
+infrastructure exists for token streaming, but the bundled skills return a
+complete string via `complete()`).
 
 ---
 
-**Step 7 — Memory persists the turn**
+**Step 7 — Memory persists the assistant turn**
 
-`MemoryStore.add_turn()` was called twice in Step 4. This:
-1. Appends both turns to the in-memory `deque`.
-2. Inserts two rows into the `conversation_turns` SQLite table:
-   ```sql
-   INSERT INTO conversation_turns (session_id, role, content, created_at)
-   VALUES ('a1b2c3d4-...', 'user', 'Design me...', 1744000000.0);
+The user turn was recorded in Step 3. After dispatch returns, the adapter records
+the assistant turn with `MemoryStore.add_turn("assistant", result.text)`. Each
+`add_turn` appends to the in-memory buffer and inserts a row into
+`conversation_turns`:
+```sql
+INSERT INTO conversation_turns (session_id, role, content, timestamp)
+VALUES ('a1b2c3d4-...', 'user', 'Give me a system design...', 1744000000.0);
 
-   INSERT INTO conversation_turns (session_id, role, content, created_at)
-   VALUES ('a1b2c3d4-...', 'assistant', '## URL Shortener Architecture\n\n...', 1744000010.0);
-   ```
+INSERT INTO conversation_turns (session_id, role, content, timestamp)
+VALUES ('a1b2c3d4-...', 'assistant', '```mermaid\n...', 1744000010.0);
+```
 
-The next user turn will retrieve these rows via `get_history()`, and Claude will have full context of the prior exchange.
+The next user turn retrieves these rows via `get_history()`, so the model has
+full context of the prior exchange.
 
 ---
 
@@ -1121,105 +1166,125 @@ The next user turn will retrieve these rows via `get_history()`, and Claude will
 ```
 CLI input
   → InputMessage construction          [adapters/cli.py]
+    → MemoryStore.get_history()        [memory/store.py → short_term.py]
+    → MemoryStore.add_turn("user", …)  [memory/store.py]
     → SkillRouter.route()              [core/router.py]
       → skill.score() × N             [skills/*.py]
     → SkillRouter.dispatch()           [core/router.py]
-      → ConversationContext built      [main.py / session layer]
-        → MemoryStore.get_history()    [memory/store.py → short_term.py]
+      → (sets context.skill_name / confidence)
       → SystemArchitectSkill.handle()  [skills/system_architect.py]
-        → ClaudeClient.stream()        [core/claude_client.py]
-          → anthropic SDK (streaming)  [external]
-          → yield TurnEvent*           [core/context.py]
-        → MemoryStore.add_turn() × 2  [memory/store.py → short_term.py]
-        → return SkillResult           [skills/base.py]
+        → ClaudeClient.complete()      [core/claude_client.py]
+          → stream() → _stream_claude()
+            → anthropic SDK (streaming) [external]
+            → yield TurnEvent*          [core/context.py]
+        → return SkillResult           [skills/system_architect.py]
     → CLIAdapter renders SkillResult   [adapters/cli.py]
+    → MemoryStore.add_turn("assistant", …)  [memory/store.py]
 ```
 
 ---
 
 ## Appendix A: SQLite Schema
 
+This is the actual DDL from `src/memory/__init__.py` (`init_db` is idempotent —
+every statement uses `IF NOT EXISTS`).
+
 ```sql
 -- Conversation history (short-term, session-scoped)
 CREATE TABLE IF NOT EXISTS conversation_turns (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id  TEXT    NOT NULL,
-    role        TEXT    NOT NULL CHECK(role IN ('user', 'assistant', 'tool')),
-    content     TEXT    NOT NULL,
-    created_at  REAL    NOT NULL
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT    NOT NULL,
+    role       TEXT    NOT NULL CHECK(role IN ('user', 'assistant', 'tool', 'system')),
+    content    TEXT    NOT NULL,
+    timestamp  REAL    NOT NULL,
+    created_at REAL    DEFAULT (unixepoch('now', 'subsec'))
 );
-CREATE INDEX IF NOT EXISTS idx_turns_session ON conversation_turns(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_turns_session
+    ON conversation_turns(session_id, timestamp);
 
 -- Long-term fact store
-CREATE TABLE IF NOT EXISTS long_term (
-    key         TEXT PRIMARY KEY,
-    value       TEXT NOT NULL,
-    metadata    TEXT,
-    created_at  REAL NOT NULL,
-    updated_at  REAL NOT NULL
+CREATE TABLE IF NOT EXISTS long_term_memory (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    metadata   TEXT DEFAULT '{}',
+    created_at REAL DEFAULT (unixepoch('now', 'subsec')),
+    updated_at REAL DEFAULT (unixepoch('now', 'subsec'))
 );
 
--- FTS5 index on long_term
-CREATE VIRTUAL TABLE IF NOT EXISTS long_term_fts
-    USING fts5(key, value, content=long_term, content_rowid=rowid);
+-- FTS5 index on long_term_memory
+CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memory_fts
+    USING fts5(key, value, content='long_term_memory', content_rowid='rowid');
 
 -- Triggers to keep FTS5 in sync
-CREATE TRIGGER IF NOT EXISTS long_term_ai
-    AFTER INSERT ON long_term BEGIN
-        INSERT INTO long_term_fts(rowid, key, value) VALUES (new.rowid, new.key, new.value);
-    END;
+CREATE TRIGGER IF NOT EXISTS ltm_fts_insert AFTER INSERT ON long_term_memory BEGIN
+    INSERT INTO long_term_memory_fts(rowid, key, value)
+        VALUES (new.rowid, new.key, new.value);
+END;
 
-CREATE TRIGGER IF NOT EXISTS long_term_ad
-    AFTER DELETE ON long_term BEGIN
-        INSERT INTO long_term_fts(long_term_fts, rowid, key, value)
-            VALUES ('delete', old.rowid, old.key, old.value);
-    END;
+CREATE TRIGGER IF NOT EXISTS ltm_fts_delete BEFORE DELETE ON long_term_memory BEGIN
+    INSERT INTO long_term_memory_fts(long_term_memory_fts, rowid, key, value)
+        VALUES ('delete', old.rowid, old.key, old.value);
+END;
 
-CREATE TRIGGER IF NOT EXISTS long_term_au
-    AFTER UPDATE ON long_term BEGIN
-        INSERT INTO long_term_fts(long_term_fts, rowid, key, value)
-            VALUES ('delete', old.rowid, old.key, old.value);
-        INSERT INTO long_term_fts(rowid, key, value) VALUES (new.rowid, new.key, new.value);
-    END;
+CREATE TRIGGER IF NOT EXISTS ltm_fts_update AFTER UPDATE ON long_term_memory BEGIN
+    INSERT INTO long_term_memory_fts(long_term_memory_fts, rowid, key, value)
+        VALUES ('delete', old.rowid, old.key, old.value);
+    INSERT INTO long_term_memory_fts(rowid, key, value)
+        VALUES (new.rowid, new.key, new.value);
+END;
 ```
 
 ---
 
 ## Appendix B: Environment Variables
 
+These reflect the variables actually read in `src/main.py` (via `python-dotenv`).
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | — | Anthropic API key |
-| `CLAWBRO_MODEL` | No | `claude-sonnet-4-6` | Override default Claude model |
+| `ANTHROPIC_API_KEY` | Yes* | — | Anthropic API key (*not required in Ollama-only mode) |
+| `CLAUDE_MODEL` | No | `claude-sonnet-4-6` | Override default Claude model |
+| `CLAUDE_MAX_TOKENS` | No | `2048` | Max tokens per response |
 | `CLAWBRO_DB_PATH` | No | `~/.clawbro/memory.db` | Override SQLite database path |
-| `CLAWBRO_CONFIG_PATH` | No | `~/.clawbro/config.toml` | Override config file path |
-| `TELEGRAM_BOT_TOKEN` | No | — | Required if Telegram adapter is enabled |
-| `DISCORD_BOT_TOKEN` | No | — | Required if Discord adapter is enabled |
-| `OLLAMA_BASE_URL` | No | `http://localhost:11434` | Override Ollama endpoint |
+| `CLAWBRO_LOG_PATH` | No | `~/.clawbro/clawbro.log` | Override log file path |
+| `TELEGRAM_BOT_TOKEN` | No | — | Required to run the Telegram adapter |
+| `TELEGRAM_ALLOWED_USER_IDS` | No | — | Comma-separated allowlist; bot fails closed if unset |
+| `DISCORD_BOT_TOKEN` | No | — | Required to run the Discord adapter |
+| `OLLAMA_ENABLED` | No | `false` | Route to Ollama instead of Claude |
+| `OLLAMA_MODEL` | No | `llama3` | Ollama model name |
+| `OLLAMA_HOST` | No | `http://localhost:11434` | Ollama endpoint |
+| `OLLAMA_API_KEY` | No | — | Required for cloud-hosted Ollama models |
 
 ---
 
 ## Appendix C: `requirements.txt` (Pinned)
 
+See [`requirements.txt`](../requirements.txt) for the authoritative list. As built:
+
 ```
 # Core (always required)
-anthropic>=0.50.0
-rich>=13.7.0
-python-dotenv>=1.0.0
-httpx>=0.27.0        # Ollama fallback HTTP client
+anthropic>=0.40.0        # Claude API client (streaming)
+python-dotenv>=1.0.0     # Loads .env into the environment
+rich>=13.0.0             # Terminal formatting for the CLI
+requests>=2.31.0         # HTTP client for the Ollama fallback
+psutil>=5.9.0            # System metrics for the system_pulse skill
 
-# Optional: adapters
-python-telegram-bot>=21.0.0
+# Optional: chat adapters
+python-telegram-bot>=21.0
 discord.py>=2.3.0
+
+# Optional: file_writer output formats
+python-docx>=1.1.0       # .docx output
+fpdf2>=2.7.0             # .pdf output
 
 # Dev / Testing
 pytest>=8.0.0
-pytest-asyncio>=0.23.0
-mypy>=1.10.0
-ruff>=0.5.0
 ```
 
-Core deps total: 4 packages + their transitive deps. Expected venv size: ~40 MB. Within budget for Raspberry Pi.
+> **Note:** the Ollama fallback uses `requests`, not `httpx`. `psutil` is a core
+> dependency because the `system_pulse` skill needs it. Config is read from
+> environment variables only — there is no `config.toml` or `tomllib` usage in
+> the current build.
 
 ---
 

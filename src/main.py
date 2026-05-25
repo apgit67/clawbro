@@ -179,6 +179,12 @@ def _parse_args() -> argparse.Namespace:
         help="Override Claude model (default: from CLAUDE_MODEL env or claude-sonnet-4-6)",
     )
     parser.add_argument(
+        "--adapter",
+        choices=("cli", "telegram", "discord"),
+        default="cli",
+        help="Which entry point to run (default: cli)",
+    )
+    parser.add_argument(
         "--ollama",
         action="store_true",
         default=False,
@@ -298,9 +304,13 @@ def main() -> None:
         ollama_api_key=ollama_api_key,
     )
 
-    # 7. Instantiate MemoryStore (session_id = new UUID)
+    # 7. Memory: the CLI uses one session-scoped store; the bot adapters create
+    #    one store per chat/channel via a factory.
+    resolved_db = str(Path(db_path).expanduser())
     session_id = str(uuid.uuid4())
-    memory = MemoryStore(session_id=session_id, db_path=str(Path(db_path).expanduser()))
+
+    def memory_factory(sid: str) -> "MemoryStore":
+        return MemoryStore(session_id=sid, db_path=resolved_db)
 
     # 8. Instantiate all skills
     from skills import get_all_skills
@@ -314,7 +324,42 @@ def main() -> None:
     from core.router import SkillRouter
     router = SkillRouter(skills=all_skills, fallback=fallback)
 
-    # 11. Start CLI adapter loop
+    # 11. Start the selected adapter
+    if args.adapter == "telegram":
+        from adapters.telegram_adapter import TelegramAdapter
+        adapter = TelegramAdapter(
+            router=router,
+            memory_factory=memory_factory,
+            claude=claude,
+        )
+        if not adapter.is_configured():
+            console.print(
+                "[red]Error:[/red] TELEGRAM_BOT_TOKEN is not set.\n"
+                "  Add it to your .env file to run the Telegram adapter."
+            )
+            sys.exit(1)
+        console.print("[dim]Starting Telegram bot. Press Ctrl+C to stop.[/dim]\n")
+        adapter.run()
+        return
+
+    if args.adapter == "discord":
+        from adapters.discord_adapter import DiscordAdapter
+        adapter = DiscordAdapter(
+            router=router,
+            memory_factory=memory_factory,
+            claude=claude,
+        )
+        if not adapter.is_configured():
+            console.print(
+                "[red]Error:[/red] DISCORD_BOT_TOKEN is not set.\n"
+                "  Add it to your .env file to run the Discord adapter."
+            )
+            sys.exit(1)
+        console.print("[dim]Starting Discord bot. Press Ctrl+C to stop.[/dim]\n")
+        adapter.run()
+        return
+
+    # Default: interactive CLI
     try:
         user_id = getpass.getuser()
     except Exception:  # noqa: BLE001
@@ -322,6 +367,7 @@ def main() -> None:
 
     console.print("[dim]Ready. Type a message or /help for commands.[/dim]\n")
 
+    memory = memory_factory(session_id)
     from adapters.cli import CLIAdapter
     cli = CLIAdapter(
         router=router,
