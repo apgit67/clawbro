@@ -1,0 +1,25 @@
+# Secrets — never commit
+.env
+latest clawbro v2 api key.txt
+*.key
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Git bundles / archives
+*.bundle
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

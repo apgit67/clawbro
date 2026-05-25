@@ -1,0 +1,11 @@
+anthropic>=0.40.0
+python-dotenv>=1.0.0
+rich>=13.0.0
+pytest>=8.0.0
+psutil>=5.9.0
+requests>=2.31.0
+python-telegram-bot>=21.0
+discord.py>=2.3.0
+# Optional — needed for file_writer skill
+python-docx>=1.1.0
+fpdf2>=2.7.0
