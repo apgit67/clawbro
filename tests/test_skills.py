@@ -35,6 +35,7 @@ from skills.data_repurposer import DataRepurposerSkill  # noqa: E402
 from skills.sandbox_guard import SandboxGuardSkill  # noqa: E402
 from skills.system_pulse import SystemPulseSkill  # noqa: E402
 from skills.research_summarizer import ResearchSummarizerSkill  # noqa: E402
+from skills.web_search import WebSearchSkill  # noqa: E402
 from skills import get_all_skills  # noqa: E402
 from core.router import SkillRouter  # noqa: E402
 
@@ -254,14 +255,36 @@ class TestResearchSummarizerSkill:
         assert _score(self.skill, msg) < 0.4, f"Expected < 0.4 for: {msg!r}"
 
 
+class TestWebSearchSkill:
+    def setup_method(self):
+        self.skill = WebSearchSkill()
+
+    @pytest.mark.parametrize("msg", [
+        "what's the latest news on the election",
+        "what is the current price of bitcoin",
+        "search the web for today's weather in Tokyo",
+        "who won the game tonight",
+        "find out what's happening with the latest iPhone release",
+    ])
+    def test_score_high_for_relevant(self, msg):
+        assert _score(self.skill, msg) >= 0.4, f"Expected >= 0.4 for: {msg!r}"
+
+    @pytest.mark.parametrize("msg", [
+        "explain how a hash map works",
+        "write a Python function to reverse a string",
+    ])
+    def test_score_low_for_irrelevant(self, msg):
+        assert _score(self.skill, msg) < 0.4, f"Expected < 0.4 for: {msg!r}"
+
+
 # ---------------------------------------------------------------------------
 # get_all_skills() — registry
 # ---------------------------------------------------------------------------
 
 class TestSkillRegistry:
-    def test_returns_seven_skills(self):
+    def test_returns_all_skills(self):
         skills = get_all_skills()
-        assert len(skills) == 8
+        assert len(skills) == 9
 
     def test_all_are_skillbase_instances(self):
         for skill in get_all_skills():
@@ -354,4 +377,5 @@ class TestSkillRouter:
         listed = self.router.list_skills()
         names = {s["name"] for s in listed}
         assert "fallback" in names
-        assert len(listed) == 9  # 8 skills + fallback
+        assert "web_search" in names
+        assert len(listed) == 10  # 9 skills + fallback

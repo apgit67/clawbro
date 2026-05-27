@@ -24,6 +24,13 @@ from rich.text import Text
 
 from core.context import ChunkEvent, ConversationContext, DoneEvent, InputMessage
 
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import InMemoryHistory
+except ImportError:  # prompt_toolkit is optional; fall back to Rich's input
+    PromptSession = None  # type: ignore[assignment]
+    InMemoryHistory = None  # type: ignore[assignment]
+
 if TYPE_CHECKING:
     from core.claude_client import ClaudeClient
     from core.router import SkillRouter
@@ -75,6 +82,13 @@ class CLIAdapter:
         self._claude = claude
         self._session_id = session_id
         self._user_id = user_id
+        # prompt_toolkit gives cross-platform cursor editing (arrow keys) and
+        # up/down history. Falls back to Rich's console.input() if unavailable.
+        self._prompt = (
+            PromptSession(history=InMemoryHistory())
+            if PromptSession is not None
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Main loop
@@ -90,7 +104,7 @@ class CLIAdapter:
 
         while True:
             try:
-                raw = console.input("[bold cyan]You:[/bold cyan] ").strip()
+                raw = self._read_input().strip()
             except (KeyboardInterrupt, EOFError):
                 console.print("\n[dim]Goodbye![/dim]")
                 break
@@ -107,6 +121,16 @@ class CLIAdapter:
 
             # Normal message — route through skill pipeline
             self._handle_message(raw)
+
+    def _read_input(self) -> str:
+        """Read one line from the user.
+
+        Prefers prompt_toolkit (arrow-key cursor editing + history); falls back
+        to Rich's console.input() when prompt_toolkit isn't installed.
+        """
+        if self._prompt is not None:
+            return self._prompt.prompt("You: ")
+        return console.input("[bold cyan]You:[/bold cyan] ")
 
     # ------------------------------------------------------------------
     # Command dispatch

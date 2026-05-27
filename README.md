@@ -89,9 +89,15 @@ match (confidence threshold 0.4). If nothing clears the bar, the general-purpose
 | **data_repurposer** | Converts and restructures data between formats |
 | **sandbox_guard** | Code-safety analysis and sandboxing advice |
 | **system_pulse** | Local system health: CPU, RAM, disk (via `psutil`) |
-| **research_summarizer** | Summarizes articles and papers |
+| **research_summarizer** | Summarizes articles and papers (from training knowledge + local files) |
+| **web_search** | Answers questions needing current info using live web search (Tavily), with cited sources |
 | **file_writer** | Generates content and writes it to a file: `.txt`, `.md`, `.csv`, `.json`, `.html`, `.docx`, `.pdf` |
 | **fallback** | General Claude assistant when no skill matches |
+
+`web_search` triggers on time-sensitive phrasing ("latest", "current", "today",
+"news", "search the web", etc.) and requires the optional `tavily-python`
+package plus a `TAVILY_API_KEY`. For knowledge that doesn't need live data, use
+`research_summarizer` instead.
 
 `file_writer` saves to `~/.clawbro/files/` by default. For safety, requested
 paths are contained to that directory — only the filename of any explicit path
@@ -115,6 +121,7 @@ All configuration is read from a `.env` file in the project root (see
 | `TELEGRAM_BOT_TOKEN` | No | — | Enables the Telegram adapter |
 | `TELEGRAM_ALLOWED_USER_IDS` | No | — | Comma-separated allowlist of Telegram user IDs |
 | `DISCORD_BOT_TOKEN` | No | — | Enables the Discord adapter |
+| `TAVILY_API_KEY` | No | — | Enables the `web_search` skill ([tavily.com](https://tavily.com)) |
 | `OLLAMA_ENABLED` | No | `false` | Route to Ollama instead of Claude |
 | `OLLAMA_MODEL` | No | `llama3` | Ollama model name |
 | `OLLAMA_HOST` | No | `http://localhost:11434` | Ollama endpoint |

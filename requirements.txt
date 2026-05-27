@@ -2,6 +2,7 @@
 anthropic>=0.40.0        # Claude API client (streaming)
 python-dotenv>=1.0.0     # Loads .env into the environment
 rich>=13.0.0             # Terminal formatting for the CLI
+prompt_toolkit>=3.0.0    # Arrow-key line editing + history in the CLI prompt
 requests>=2.31.0         # HTTP client for the Ollama fallback
 psutil>=5.9.0            # System metrics for the system_pulse skill
 
@@ -9,6 +10,10 @@ psutil>=5.9.0            # System metrics for the system_pulse skill
 # Only needed if you run the Telegram or Discord bot.
 python-telegram-bot>=21.0
 discord.py>=2.3.0
+
+# ── Optional: web_search skill ───────────────────────────────────
+# Only needed for live web search. Requires TAVILY_API_KEY in .env.
+tavily-python>=0.5.0
 
 # ── Optional: file_writer skill output formats ───────────────────
 # Only needed to write Word / PDF documents.

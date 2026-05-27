@@ -130,15 +130,38 @@ Claude API (provided `ANTHROPIC_API_KEY` is set).
 
 ---
 
-## 8. Chat adapters (Telegram / Discord) — optional
+## 8. Live web search (optional)
 
-The Telegram and Discord adapters are implemented under `src/adapters/`, but the
-`main.py` entry point currently launches the **CLI adapter only**. The startup
-banner will report whether `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` are set,
-but wiring an adapter as the active entry point requires instantiating it
-yourself (see `TelegramAdapter` / `DiscordAdapter` in `src/adapters/`).
+The `web_search` skill answers questions that need current information from the
+internet (news, prices, "latest", "today") using the
+[Tavily](https://tavily.com) search API, and cites its sources.
 
-When you do run the Telegram bot, **set your allowlist first**:
+1. Install the optional package: `pip install tavily-python`
+2. Get a key at [tavily.com](https://tavily.com) and add it to `.env`:
+   ```
+   TAVILY_API_KEY=tvly-your-key-here
+   ```
+
+Without the key (or the package), the skill returns a clear message telling you
+what to install or set. Questions that don't need live data are handled by
+`research_summarizer` instead.
+
+---
+
+## 9. Chat adapters (Telegram / Discord) — optional
+
+The Telegram and Discord adapters are selected with the `--adapter` flag:
+
+```bash
+python src/main.py --adapter telegram
+python src/main.py --adapter discord
+```
+
+Each requires its bot token to be set (`TELEGRAM_BOT_TOKEN` /
+`DISCORD_BOT_TOKEN`); if the token is missing, ClawBro prints an error and
+exits. The default `--adapter cli` runs the interactive terminal.
+
+When you run the Telegram bot, **set your allowlist first**:
 ```
 TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_ALLOWED_USER_IDS=11111111,22222222
@@ -148,7 +171,7 @@ prevents a public bot from being driven by strangers on your API budget.
 
 ---
 
-## 9. Running the tests
+## 10. Running the tests
 
 ```bash
 pytest
@@ -167,5 +190,6 @@ All tests should pass against a working Python 3.11+ environment.
 | PowerShell won't run `Activate.ps1` | Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, then re-activate. |
 | `ModuleNotFoundError` | Make sure the virtual environment is activated and `pip install -r requirements.txt` completed. |
 | `.docx` / `.pdf` export fails | Install the optional packages: `pip install python-docx fpdf2`. |
+| Web search says key/package missing | `pip install tavily-python` and set `TAVILY_API_KEY` in `.env`. |
 | Ollama auth error | Verify `OLLAMA_API_KEY` for cloud models, or run `ollama signin` for local session auth. |
 | Wrong Python version | ClawBro needs 3.11+. Check `python --version`; on some systems use `python3`. |
