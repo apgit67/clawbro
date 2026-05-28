@@ -715,12 +715,14 @@ This table reflects the libraries actually used in the current build.
 | **Language** | Python | 3.11+ | Dataclasses, union types, speed improvements |
 | **Claude API** | `anthropic` | >=0.40.0 | Official Anthropic SDK, streaming support |
 | **CLI formatting** | `rich` | >=13.0 | Pretty tables, live streaming output panels |
+| **CLI line editing** | `prompt_toolkit` | >=3.0 | Cross-platform arrow-key cursor editing + history at the prompt |
 | **Env config** | `python-dotenv` | >=1.0 | Load `.env` file into `os.environ` on startup |
 | **Memory** | `sqlite3` | stdlib | No extra dependency. WAL mode, FTS5 extension |
 | **System metrics** | `psutil` | >=5.9 | Core dep — powers the `system_pulse` skill |
 | **HTTP client** | `requests` | >=2.31 | Used for the Ollama fallback (local + cloud) |
 | **Telegram adapter** | `python-telegram-bot` | >=21.0 | Optional. Async-first |
 | **Discord adapter** | `discord.py` | >=2.3 | Optional. Async-first |
+| **Web search** | `tavily-python` | >=0.5 | Optional — live web search for the `web_search` skill |
 | **File output** | `python-docx`, `fpdf2` | >=1.1 / >=2.7 | Optional — `.docx` / `.pdf` output for `file_writer` |
 | **Testing** | `pytest` | >=8.0 | Test suite |
 
@@ -797,7 +799,7 @@ router = SkillRouter(skills=get_all_skills(), fallback=FallbackSkill())
 #   SystemArchitectSkill, KnowledgeSynthesizerSkill,
 #   TechnicalProposalGeneratorSkill, DataRepurposerSkill,
 #   SandboxGuardSkill, SystemPulseSkill, ResearchSummarizerSkill,
-#   FileWriterSkill
+#   WebSearchSkill, FileWriterSkill
 # FallbackSkill is passed separately and is never scored.
 ```
 
@@ -850,6 +852,7 @@ claudeclaw v2/
 │   │   ├── sandbox_guard.py              # Skill: safe code execution analysis and sandboxing advice
 │   │   ├── system_pulse.py               # Skill: system health metrics (disk, CPU, RAM via psutil)
 │   │   ├── research_summarizer.py        # Skill: article/paper summarization and extraction
+│   │   ├── web_search.py                 # Skill: live web search via Tavily, with cited sources
 │   │   ├── file_writer.py                # Skill: generate content and write to .txt/.md/.csv/.json/.html/.docx/.pdf
 │   │   └── fallback.py                   # Re-exports FallbackSkill from base.py (convenience import)
 │   │
@@ -894,6 +897,7 @@ claudeclaw v2/
 | `skills/sandbox_guard.py` | Code safety analysis, subprocess sandboxing recommendations |
 | `skills/system_pulse.py` | `psutil` stats collection, formatted health report |
 | `skills/research_summarizer.py` | Paper/article reading and structured summarization |
+| `skills/web_search.py` | Live web search via Tavily API, with inline citations |
 | `memory/short_term.py` | In-memory ring buffer, per-session SQLite writes |
 | `memory/long_term.py` | SQLite FTS5 CRUD, key-value persistence |
 | `memory/store.py` | Unified facade; session-scoped `MemoryStore` instances |
@@ -1250,6 +1254,7 @@ These reflect the variables actually read in `src/main.py` (via `python-dotenv`)
 | `TELEGRAM_BOT_TOKEN` | No | — | Required to run the Telegram adapter |
 | `TELEGRAM_ALLOWED_USER_IDS` | No | — | Comma-separated allowlist; bot fails closed if unset |
 | `DISCORD_BOT_TOKEN` | No | — | Required to run the Discord adapter |
+| `TAVILY_API_KEY` | No | — | Enables the `web_search` skill (tavily.com) |
 | `OLLAMA_ENABLED` | No | `false` | Route to Ollama instead of Claude |
 | `OLLAMA_MODEL` | No | `llama3` | Ollama model name |
 | `OLLAMA_HOST` | No | `http://localhost:11434` | Ollama endpoint |
@@ -1266,12 +1271,16 @@ See [`requirements.txt`](../requirements.txt) for the authoritative list. As bui
 anthropic>=0.40.0        # Claude API client (streaming)
 python-dotenv>=1.0.0     # Loads .env into the environment
 rich>=13.0.0             # Terminal formatting for the CLI
+prompt_toolkit>=3.0.0    # Arrow-key line editing + history in the CLI prompt
 requests>=2.31.0         # HTTP client for the Ollama fallback
 psutil>=5.9.0            # System metrics for the system_pulse skill
 
 # Optional: chat adapters
 python-telegram-bot>=21.0
 discord.py>=2.3.0
+
+# Optional: web_search skill
+tavily-python>=0.5.0     # Tavily API client (needs TAVILY_API_KEY)
 
 # Optional: file_writer output formats
 python-docx>=1.1.0       # .docx output
